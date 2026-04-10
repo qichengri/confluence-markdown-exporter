@@ -12,6 +12,7 @@ from confluence_markdown_exporter.api_clients import ApiClientFactory
 from confluence_markdown_exporter.api_clients import AuthNotConfiguredError
 from confluence_markdown_exporter.api_clients import ConfluenceRef
 from confluence_markdown_exporter.api_clients import get_confluence_instance
+from confluence_markdown_exporter.api_clients import log_api_response_hook
 from confluence_markdown_exporter.api_clients import parse_confluence_path
 from confluence_markdown_exporter.api_clients import response_hook
 from confluence_markdown_exporter.api_clients import routing_path_for_parse
@@ -229,6 +230,31 @@ class TestSpaceFromUrlContextPath:
 
         mock_from_key.assert_called_once_with("PROJ", "https://internal.example.com/confluence")
         assert result is mock_space
+
+
+class TestLogApiResponseHook:
+    """Tests for log_api_response_hook."""
+
+    @patch("confluence_markdown_exporter.api_clients.console")
+    def test_prints_method_url_status(self, mock_console: MagicMock) -> None:
+        """Every response prints method, URL, and status to the Rich console."""
+        response = MagicMock(spec=requests.Response)
+        response.status_code = 200
+        response.url = "https://example.com/confluence/rest/api/content/1"
+        req = MagicMock()
+        req.method = "GET"
+        req.url = "https://example.com/confluence/rest/api/content/1?expand=body.view"
+        response.request = req
+
+        result = log_api_response_hook(response)
+
+        assert result is response
+        mock_console.print.assert_called_once()
+        printed = mock_console.print.call_args[0][0]
+        assert "GET" in printed
+        assert "expand=body.view" in printed
+        assert "HTTP 200" in printed
+        assert mock_console.print.call_args[1].get("markup") is False
 
 
 class TestResponseHook:

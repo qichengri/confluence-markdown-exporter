@@ -415,8 +415,13 @@ class Attachment(Document):
         return mimetypes.guess_extension(self.media_type) or ""
 
     @property
+    def _file_id_or_fallback(self) -> str:
+        """file_id when available; otherwise fall back to attachment id to keep paths unique."""
+        return self.file_id or self.id or "attachment"
+
+    @property
     def filename(self) -> str:
-        return f"{self.file_id}{self.extension}"
+        return f"{self._file_id_or_fallback}{self.extension}"
 
     @property
     def _template_vars(self) -> dict[str, str]:
@@ -424,8 +429,7 @@ class Attachment(Document):
             **super()._template_vars,
             "attachment_id": str(self.id),
             "attachment_title": sanitize_filename(self.title),
-            # file_id is a GUID and does not need sanitized.
-            "attachment_file_id": self.file_id,
+            "attachment_file_id": self._file_id_or_fallback,
             "attachment_extension": self.extension,
         }
 
@@ -701,7 +705,8 @@ class Page(Document):
                 a.filename.endswith((".drawio.png", ".drawio"))
                 and a.title.replace(" ", "%20") in self.body_export
             )
-            or a.file_id in self.body
+            or (a.file_id and a.file_id in self.body)
+            or (a.id and a.id in self.body)
         ]
 
     def export_attachments(self) -> dict[str, AttachmentEntry]:
