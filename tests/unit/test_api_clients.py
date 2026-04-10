@@ -11,6 +11,7 @@ from atlassian.errors import ApiError
 from confluence_markdown_exporter.api_clients import ApiClientFactory
 from confluence_markdown_exporter.api_clients import AuthNotConfiguredError
 from confluence_markdown_exporter.api_clients import ConfluenceRef
+from confluence_markdown_exporter.api_clients import _install_request_logging
 from confluence_markdown_exporter.api_clients import get_confluence_instance
 from confluence_markdown_exporter.api_clients import log_api_response_hook
 from confluence_markdown_exporter.api_clients import parse_confluence_path
@@ -230,6 +231,33 @@ class TestSpaceFromUrlContextPath:
 
         mock_from_key.assert_called_once_with("PROJ", "https://internal.example.com/confluence")
         assert result is mock_space
+
+
+class TestInstallRequestLogging:
+    """Tests for _install_request_logging (pre-request console log)."""
+
+    @patch("confluence_markdown_exporter.api_clients.console")
+    def test_prints_before_send(self, mock_console: MagicMock) -> None:
+        """Wrapped send prints method and URL before dispatching the request."""
+        mock_response = MagicMock(spec=requests.Response)
+        mock_response.status_code = 200
+        original_send = MagicMock(return_value=mock_response)
+
+        session = requests.Session()
+        session.send = original_send  # type: ignore[method-assign]
+        _install_request_logging(session)
+
+        prepared = requests.Request("GET", "https://example.com/rest/api/content/1").prepare()
+        result = session.send(prepared)
+
+        assert result is mock_response
+        original_send.assert_called_once_with(prepared)
+        mock_console.print.assert_called_once()
+        printed = mock_console.print.call_args[0][0]
+        assert "GET" in printed
+        assert "example.com" in printed
+        assert "..." in printed
+        assert mock_console.print.call_args[1].get("markup") is False
 
 
 class TestLogApiResponseHook:

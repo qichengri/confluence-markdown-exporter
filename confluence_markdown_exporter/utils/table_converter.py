@@ -1,5 +1,3 @@
-from typing import cast
-
 from bs4 import BeautifulSoup
 from bs4 import Tag
 from markdownify import MarkdownConverter
@@ -62,15 +60,52 @@ def _normalize_table_cell_text(text: str) -> str:
     )
 
 
+def _collect_direct_rows(table: Tag) -> list[list[Tag]]:
+    """Collect only the direct-level <tr> elements of *table*, skipping nested tables."""
+    rows: list[list[Tag]] = []
+    containers = [
+        child
+        for child in table.children
+        if isinstance(child, Tag) and child.name in ("thead", "tbody", "tfoot")
+    ]
+    if not containers:
+        containers = [table]
+    for container in containers:
+        for child in container.children:
+            if isinstance(child, Tag) and child.name == "tr":
+                cells = [c for c in child.children if isinstance(c, Tag) and c.name in ("td", "th")]
+                rows.append(cells)
+    return rows
+
+
+def _has_nested_table(el: Tag) -> bool:
+    """Return True if any cell inside *el* contains a nested <table>."""
+    return any(cell.find("table") for cell in el.find_all(["td", "th"]))
+
+
 class TableConverter(MarkdownConverter):
     """Custom MarkdownConverter for converting HTML tables to markdown tables."""
 
+    def _convert_table_as_html(self, el: BeautifulSoup) -> str:
+        """Keep outer HTML structure but convert cell contents to Markdown."""
+        el_copy = BeautifulSoup(str(el), "html.parser")
+        table = el_copy.find("table") or el_copy
+        for row in _collect_direct_rows(table):
+            for cell in row:
+                inner_html = cell.decode_contents()
+                if not inner_html.strip():
+                    continue
+                converted = self.convert(inner_html).strip()
+                cell.clear()
+                if converted:
+                    cell.string = converted
+        return f"\n{table}\n"
+
     def convert_table(self, el: BeautifulSoup, text: str, parent_tags: list[str]) -> str:
-        rows = [
-            cast("list[Tag]", tr.find_all(["td", "th"]))
-            for tr in cast("list[Tag]", el.find_all("tr"))
-            if tr
-        ]
+        if _has_nested_table(el):
+            return self._convert_table_as_html(el)
+
+        rows = _collect_direct_rows(el)
 
         if not rows:
             return ""

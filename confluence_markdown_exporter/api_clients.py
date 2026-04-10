@@ -188,6 +188,21 @@ def _jira_auth_failure_hook(
     return response
 
 
+def _install_request_logging(session: requests.Session) -> None:
+    """Wrap ``session.send`` to print a console line *before* each HTTP request."""
+    original_send = session.send
+
+    def logging_send(request: requests.PreparedRequest, **kwargs: object) -> requests.Response:
+        console.print(
+            f"API {request.method} {request.url} ...",
+            markup=False,
+            highlight=False,
+        )
+        return original_send(request, **kwargs)
+
+    session.send = logging_send  # type: ignore[method-assign]
+
+
 def log_api_response_hook(
     response: requests.Response, *_args: object, **_kwargs: object
 ) -> requests.Response:
@@ -304,6 +319,7 @@ def get_confluence_instance(url: str) -> ConfluenceApiSdk:
         logger.exception("[red bold]Confluence authentication failed for %s.[/red bold]", url)
         raise AuthNotConfiguredError(url, "Confluence") from e
 
+    _install_request_logging(client.session)
     client.session.hooks["response"] = [log_api_response_hook, response_hook]
 
     with _clients_lock:
@@ -377,6 +393,7 @@ def get_jira_instance(url: str) -> JiraApiSdk:
         logger.exception("[red bold]Jira authentication failed for %s.[/red bold]", url)
         raise AuthNotConfiguredError(url, "Jira") from e
 
+    _install_request_logging(client.session)
     client.session.hooks["response"] = [
         log_api_response_hook,
         _jira_auth_failure_hook,
