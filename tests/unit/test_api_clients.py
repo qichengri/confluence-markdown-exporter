@@ -14,6 +14,7 @@ from confluence_markdown_exporter.api_clients import ConfluenceRef
 from confluence_markdown_exporter.api_clients import get_confluence_instance
 from confluence_markdown_exporter.api_clients import parse_confluence_path
 from confluence_markdown_exporter.api_clients import response_hook
+from confluence_markdown_exporter.api_clients import routing_path_for_parse
 from confluence_markdown_exporter.utils.app_data_store import ApiDetails
 from confluence_markdown_exporter.utils.app_data_store import AtlassianSdkConnectionConfig
 from confluence_markdown_exporter.utils.app_data_store import ConfigModel
@@ -135,6 +136,99 @@ class TestParseConfluencePath:
         else:
             assert result is not None
             assert result.model_dump() == expected.model_dump()
+
+
+_ROUTING_PATH_FOR_PARSE_CASES = [
+    (
+        "/confluence/spaces/SPACEKEY/pages/123456789/Page+Title",
+        "https://corp.example.com/confluence",
+        "/spaces/SPACEKEY/pages/123456789/Page+Title",
+    ),
+    (
+        "/confluence/spaces/SPACEKEY/overview",
+        "https://corp.example.com/confluence",
+        "/spaces/SPACEKEY/overview",
+    ),
+    (
+        "/wiki/spaces/SPACEKEY/pages/1/T",
+        "https://company.atlassian.net",
+        "/wiki/spaces/SPACEKEY/pages/1/T",
+    ),
+    (
+        "/spaces/SPACEKEY/pages/1/T",
+        "https://wiki.aaa.aaa",
+        "/spaces/SPACEKEY/pages/1/T",
+    ),
+    (
+        "/ex/confluence/my-cloud-id/wiki/spaces/KEY/pages/42/x",
+        "https://api.atlassian.com/ex/confluence/my-cloud-id",
+        "/wiki/spaces/KEY/pages/42/x",
+    ),
+    (
+        "/other/spaces/SPACEKEY/pages/1/T",
+        "https://corp.example.com/confluence",
+        "/other/spaces/SPACEKEY/pages/1/T",
+    ),
+]
+
+
+class TestRoutingPathForParse:
+    """Strip servlet context before parse_confluence_path."""
+
+    @pytest.mark.parametrize(("path", "base_url", "expected"), _ROUTING_PATH_FOR_PARSE_CASES)
+    def test_routing_path_for_parse(self, path: str, base_url: str, expected: str) -> None:
+        assert routing_path_for_parse(path, base_url) == expected
+
+    def test_empty_path_unchanged(self) -> None:
+        assert routing_path_for_parse("", "https://h/confluence") == ""
+
+    def test_strip_then_parse_dc_style(self) -> None:
+        base = "https://confluence.example.com/confluence"
+        raw = "/confluence/spaces/POINTSERVICE/pages/6409994109/Spec"
+        routed = routing_path_for_parse(raw, base)
+        ref = parse_confluence_path(routed)
+        assert ref is not None
+        assert ref.space_key == "POINTSERVICE"
+        assert ref.page_id == 6409994109
+        assert ref.page_title == "Spec"
+
+
+class TestPageFromUrlContextPath:
+    """Page.from_url resolves browser URLs with servlet context."""
+
+    @patch("confluence_markdown_exporter.confluence.Page.from_id")
+    def test_page_from_url_strips_confluence_context(
+        self, mock_from_id: MagicMock
+    ) -> None:
+        from confluence_markdown_exporter.confluence import Page
+
+        mock_page = MagicMock()
+        mock_from_id.return_value = mock_page
+
+        url = "https://internal.example.com/confluence/spaces/MYSPACE/pages/9876543210/Title+Here"
+        result = Page.from_url(url)
+
+        mock_from_id.assert_called_once_with(9876543210, "https://internal.example.com/confluence")
+        assert result is mock_page
+
+
+class TestSpaceFromUrlContextPath:
+    """Space.from_url resolves browser URLs with servlet context."""
+
+    @patch("confluence_markdown_exporter.confluence.Space.from_key")
+    def test_space_from_url_strips_confluence_context(
+        self, mock_from_key: MagicMock
+    ) -> None:
+        from confluence_markdown_exporter.confluence import Space
+
+        mock_space = MagicMock()
+        mock_from_key.return_value = mock_space
+
+        url = "https://internal.example.com/confluence/spaces/PROJ/overview"
+        result = Space.from_url(url)
+
+        mock_from_key.assert_called_once_with("PROJ", "https://internal.example.com/confluence")
+        assert result is mock_space
 
 
 class TestResponseHook:

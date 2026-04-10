@@ -118,6 +118,27 @@ _SERVER_URL_RE = re.compile(
 )
 
 
+def routing_path_for_parse(path: str, confluence_base_url: str) -> str:
+    """Strip the Confluence webapp context path from *path* for URL parsing.
+
+    *confluence_base_url* must be the REST/SDK base (e.g. from
+    ``_extract_base_url``), so its ``urlparse(...).path`` matches the servlet
+    prefix (e.g. ``/confluence``). Cloud URLs typically have an empty path
+    prefix, so *path* is returned unchanged.
+    """
+    if not path:
+        return path
+    if not path.startswith("/"):
+        path = "/" + path
+    prefix = urllib.parse.urlparse(confluence_base_url).path.rstrip("/") or ""
+    if not prefix:
+        return path
+    if path == prefix or path.startswith(prefix + "/"):
+        stripped = path[len(prefix):] or "/"
+        return stripped if stripped.startswith("/") else f"/{stripped}"
+    return path
+
+
 def parse_confluence_path(path: str) -> ConfluenceRef | None:
     """Parse only the path portion of a Confluence URL and return a ConfluenceRef dict.
 

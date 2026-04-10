@@ -41,6 +41,7 @@ from rich.progress import TextColumn
 from rich.progress import TimeElapsedColumn
 from rich.progress import TimeRemainingColumn
 
+from confluence_markdown_exporter.api_clients import ConfluenceRef
 from confluence_markdown_exporter.api_clients import JiraAuthenticationError
 from confluence_markdown_exporter.api_clients import build_gateway_url
 from confluence_markdown_exporter.api_clients import get_confluence_instance
@@ -49,6 +50,7 @@ from confluence_markdown_exporter.api_clients import get_thread_confluence
 from confluence_markdown_exporter.api_clients import handle_jira_auth_failure
 from confluence_markdown_exporter.api_clients import parse_confluence_path
 from confluence_markdown_exporter.api_clients import parse_gateway_url
+from confluence_markdown_exporter.api_clients import routing_path_for_parse
 from confluence_markdown_exporter.utils.app_data_store import get_settings
 from confluence_markdown_exporter.utils.app_data_store import normalize_instance_url
 from confluence_markdown_exporter.utils.drawio_converter import load_and_parse_drawio
@@ -342,7 +344,8 @@ class Space(BaseModel):
         get_confluence_instance(base_url)
 
         parsed = urllib.parse.urlparse(space_url)
-        if match := parse_confluence_path(parsed.path):
+        routing_path = routing_path_for_parse(parsed.path, base_url)
+        if match := parse_confluence_path(routing_path):
             if match.space_key:
                 logger.debug("Resolved space key '%s' from URL %s", match.space_key, space_url)
                 return cls.from_key(match.space_key, base_url)
@@ -848,7 +851,8 @@ class Page(Document):
         get_confluence_instance(base_url)
 
         parsed = urllib.parse.urlparse(page_url)
-        if match := parse_confluence_path(parsed.path):
+        routing_path = routing_path_for_parse(parsed.path, base_url)
+        if match := parse_confluence_path(routing_path):
             if match.page_id:
                 logger.debug("Resolved page id=%s from Confluence URL %s", match.page_id, page_url)
                 return Page.from_id(match.page_id, base_url)
@@ -1140,6 +1144,32 @@ class Page(Document):
                 return f"[^{text}]:"  # Footnote definition
             return f"[^{text}]"  # f"<sup>{text}</sup>"
 
+        def _parse_confluence_link_ref(self, href: str) -> ConfluenceRef | None:
+            """Parse a page/space path from *href* using this page's Confluence base URL."""
+            if not href:
+                return None
+            base_url = self.page.base_url
+            parsed_base = urllib.parse.urlparse(base_url)
+
+            if href.startswith(("http://", "https://")):
+                parsed_href = urllib.parse.urlparse(href)
+                path = parsed_href.path
+                if parsed_href.netloc == parsed_base.netloc:
+                    path = routing_path_for_parse(path, base_url)
+                return parse_confluence_path(path)
+            if href.startswith("//"):
+                scheme = parsed_base.scheme or "https"
+                parsed_href = urllib.parse.urlparse(f"{scheme}:{href}")
+                path = parsed_href.path
+                if parsed_href.netloc == parsed_base.netloc:
+                    path = routing_path_for_parse(path, base_url)
+                return parse_confluence_path(path)
+            if href.startswith("/"):
+                path = urllib.parse.urlparse(href).path
+                path = routing_path_for_parse(path, base_url)
+                return parse_confluence_path(path)
+            return parse_confluence_path(href)
+
         def convert_a(self, el: BeautifulSoup, text: str, parent_tags: list[str]) -> str:  # noqa: PLR0911, C901
             if "user-mention" in str(el.get("class")):
                 return self.convert_user_mention(el, text, parent_tags)
@@ -1177,7 +1207,7 @@ class Page(Document):
                 link = self.convert_attachment_link(el, text, parent_tags)
                 # convert_attachment_link may return None if the attachment meta is incomplete
                 return link or f"[{text}]({el.get('href')})"
-            if match := parse_confluence_path(str(el.get("href", ""))):
+            if match := self._parse_confluence_link_ref(str(el.get("href", ""))):
                 if match.page_id:
                     return self.convert_page_link(match.page_id)
             if str(el.get("href", "")).startswith("#"):
