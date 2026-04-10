@@ -454,3 +454,100 @@ class TestGetConfluenceInstance:
         assert exc_info.value.url == SAMPLE_CONFLUENCE_URL
         assert exc_info.value.service == "Confluence"
         assert mock_factory.create_confluence.call_count == 1
+
+
+class TestLazyHomepageResolution:
+    """Verify homepage API calls are skipped when templates don't use {homepage_*}."""
+
+    _ATT_PATH = (
+        "{space_name}/attachments"
+        "/{attachment_file_id}{attachment_extension}"
+    )
+
+    @patch("confluence_markdown_exporter.confluence.get_thread_confluence")
+    @patch("confluence_markdown_exporter.confluence.settings")
+    def test_space_from_key_skips_homepage_expand(
+        self, mock_settings: MagicMock, mock_get_thread: MagicMock
+    ) -> None:
+        from confluence_markdown_exporter.confluence import Space
+
+        Space.from_key.cache_clear()
+
+        mock_settings.export.page_path = "{space_name}/{page_title}.md"
+        mock_settings.export.attachment_path = self._ATT_PATH
+
+        mock_client = MagicMock()
+        mock_client.get_space.return_value = {
+            "key": "TEST", "name": "Test", "description": {},
+        }
+        mock_get_thread.return_value = mock_client
+
+        Space.from_key("TEST", "https://example.com")
+        mock_client.get_space.assert_called_once_with("TEST", expand="")
+
+        Space.from_key.cache_clear()
+
+    @patch("confluence_markdown_exporter.confluence.get_thread_confluence")
+    @patch("confluence_markdown_exporter.confluence.settings")
+    def test_space_from_key_expands_homepage(
+        self, mock_settings: MagicMock, mock_get_thread: MagicMock
+    ) -> None:
+        from confluence_markdown_exporter.confluence import Space
+
+        Space.from_key.cache_clear()
+
+        mock_settings.export.page_path = (
+            "{space_name}/{homepage_title}/{page_title}.md"
+        )
+        mock_settings.export.attachment_path = self._ATT_PATH
+
+        mock_client = MagicMock()
+        mock_client.get_space.return_value = {
+            "key": "TEST", "name": "Test", "description": {},
+            "homepage": {"id": 999},
+        }
+        mock_get_thread.return_value = mock_client
+
+        Space.from_key("TEST", "https://example.com")
+        mock_client.get_space.assert_called_once_with(
+            "TEST", expand="homepage"
+        )
+
+        Space.from_key.cache_clear()
+
+    @patch("confluence_markdown_exporter.confluence.get_thread_confluence")
+    @patch("confluence_markdown_exporter.confluence.settings")
+    def test_template_vars_skips_homepage_fetch(
+        self, mock_settings: MagicMock, mock_get_thread: MagicMock
+    ) -> None:
+        from confluence_markdown_exporter.confluence import Ancestor
+        from confluence_markdown_exporter.confluence import Document
+        from confluence_markdown_exporter.confluence import Space
+        from confluence_markdown_exporter.confluence import Version
+
+        mock_settings.export.page_path = "{space_name}/{page_title}.md"
+        mock_settings.export.attachment_path = self._ATT_PATH
+
+        space = Space(
+            base_url="https://example.com",
+            key="T", name="Test", description="", homepage=42,
+        )
+
+        class _Doc(Document):
+            pass
+
+        _Doc.model_rebuild(_types_namespace={"Ancestor": Ancestor})
+
+        doc = _Doc(
+            base_url="https://example.com",
+            title="My Page",
+            space=space,
+            ancestors=[],
+            version=Version.from_json({}),
+        )
+
+        tvars = doc._template_vars
+
+        mock_get_thread.return_value.get_page_by_id.assert_not_called()
+        assert tvars["homepage_id"] == ""
+        assert tvars["homepage_title"] == ""

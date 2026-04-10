@@ -317,10 +317,15 @@ class Space(BaseModel):
     @classmethod
     @functools.lru_cache(maxsize=100)
     def from_key(cls, space_key: str, base_url: str) -> "Space":
+        needs_homepage = (
+            "{homepage_" in settings.export.page_path
+            or "{homepage_" in settings.export.attachment_path
+        )
+        expand = "homepage" if needs_homepage else ""
         return cls.from_json(
             cast(
                 "JsonResponse",
-                get_thread_confluence(base_url).get_space(space_key, expand="homepage"),
+                get_thread_confluence(base_url).get_space(space_key, expand=expand),
             ),
             base_url,
         )
@@ -375,14 +380,29 @@ class Document(BaseModel):
     ancestors: list["Ancestor"]
     version: Version
 
+    def _fetch_homepage_title(self, page_id: int) -> str:
+        """Fetch only the title of a page without expanding body or other heavy fields."""
+        try:
+            data = get_thread_confluence(self.base_url).get_page_by_id(
+                page_id, expand="version"
+            )
+            return data.get("title", "")
+        except Exception:  # noqa: BLE001
+            logger.warning("Could not fetch homepage title for page id=%s", page_id)
+            return ""
+
     @property
     def _template_vars(self) -> dict[str, str]:
         homepage_id = ""
         homepage_title = ""
-        if self.space.homepage:
+        needs_homepage = (
+            "{homepage_" in settings.export.page_path
+            or "{homepage_" in settings.export.attachment_path
+        )
+        if needs_homepage and self.space.homepage:
             homepage_id = str(self.space.homepage)
             homepage_title = sanitize_filename(
-                Page.from_id(self.space.homepage, self.base_url).title
+                self._fetch_homepage_title(self.space.homepage)
             )
 
         return {
@@ -884,15 +904,23 @@ class Page(Document):
         """Create a custom MarkdownConverter for Confluence HTML to Markdown conversion."""
 
         class Options(MarkdownConverter.DefaultOptions):  # type: ignore[assignment]
+            autolinks = False
             bullets = "-"
             heading_style = ATX
             macros_to_ignore: Set[str] = frozenset(["qc-read-and-understood-signature-box"])
             front_matter_indent = 2
 
+        _RE_NON_TAG_ANGLE = re.compile(r"<(?![a-zA-Z/!])")
+
         def __init__(self, page: "Page", **options) -> None:  # noqa: ANN003
             super().__init__(**options)
             self.page = page
             self.page_properties = {}
+
+        def escape(self, text: str, parent_tags: list[str]) -> str:
+            return self._RE_NON_TAG_ANGLE.sub(
+                r"\<", super().escape(text, parent_tags)
+            )
 
         @property
         def markdown(self) -> str:
@@ -1225,6 +1253,13 @@ class Page(Document):
             if not page_id:
                 msg = "Page link does not have valid page_id."
                 raise ValueError(msg)
+
+            if settings.export.page_href == "confluence":
+                base = self.page.base_url
+                url = f"{base}/pages/viewpage.action?pageId={page_id}"
+                page = Page.from_id(page_id, base)
+                title = page.title if page.title != "Page not accessible" else f"Page {page_id}"
+                return f"[{title}]({url})"
 
             page = Page.from_id(page_id, self.page.base_url)
 

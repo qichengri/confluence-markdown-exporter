@@ -54,6 +54,8 @@ def make_empty_cell() -> Tag:
 def _normalize_table_cell_text(text: str) -> str:
     return (
         text.replace("|", "\\|")  # Escape pipe characters to prevent breaking table formatting
+        .replace("{", "\\{")  # Escape curly braces to prevent MDX/JSX expression parsing
+        .replace("}", "\\}")
         .replace("\n", "<br/>")  # Replace newlines with <br/> to preserve line breaks in tables
         .removesuffix("<br/>")  # Remove trailing <br/> that may be added by the last cell in a row
         .removeprefix("<br/>")  # Remove leading <br/> that may be added by the first cell in a row
@@ -87,21 +89,32 @@ class TableConverter(MarkdownConverter):
     """Custom MarkdownConverter for converting HTML tables to markdown tables."""
 
     def _convert_table_as_html(self, el: BeautifulSoup) -> str:
-        """Keep outer HTML structure but convert cell contents to Markdown."""
-        el_copy = BeautifulSoup(str(el), "html.parser")
-        table = el_copy.find("table") or el_copy
-        for row in _collect_direct_rows(table):
-            for cell in row:
-                inner_html = cell.decode_contents()
-                if not inner_html.strip():
-                    continue
-                converted = self.convert(inner_html).strip()
-                cell.clear()
-                if converted:
-                    cell.string = converted
-        return f"\n{table}\n"
+        """Output the table as raw HTML to preserve nested structure.
+
+        The output is collapsed to a single line so that MDX parsers do not
+        split the HTML block at blank lines.  Newlines inside ``<pre>`` are
+        kept as ``&#10;`` entities so they still render correctly.  Curly
+        braces are escaped as ``&#123;``/``&#125;`` to avoid JSX expression
+        parsing.
+        """
+        soup = BeautifulSoup(str(el), "html.parser")
+        for pre in soup.find_all("pre"):
+            if pre.string:
+                pre.string = pre.string.replace("\n", "&#10;")
+        html = str(soup)
+        html = html.replace("{", "&#123;").replace("}", "&#125;")
+        html = html.replace("\n", " ")
+        return f"\n{html}\n"
 
     def convert_table(self, el: BeautifulSoup, text: str, parent_tags: list[str]) -> str:
+        if el.has_attr("style"):
+            del el["style"]
+        for tag in el.find_all(style=True):
+            del tag["style"]
+
+        for a in el.find_all("a", class_="user-mention"):
+            a.replace_with(a.get_text())
+
         if _has_nested_table(el):
             return self._convert_table_as_html(el)
 
