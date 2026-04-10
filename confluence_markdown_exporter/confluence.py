@@ -41,6 +41,7 @@ from rich.progress import TextColumn
 from rich.progress import TimeElapsedColumn
 from rich.progress import TimeRemainingColumn
 
+from confluence_markdown_exporter.api_clients import ConfluenceRef
 from confluence_markdown_exporter.api_clients import JiraAuthenticationError
 from confluence_markdown_exporter.api_clients import build_gateway_url
 from confluence_markdown_exporter.api_clients import get_confluence_instance
@@ -49,6 +50,7 @@ from confluence_markdown_exporter.api_clients import get_thread_confluence
 from confluence_markdown_exporter.api_clients import handle_jira_auth_failure
 from confluence_markdown_exporter.api_clients import parse_confluence_path
 from confluence_markdown_exporter.api_clients import parse_gateway_url
+from confluence_markdown_exporter.api_clients import routing_path_for_parse
 from confluence_markdown_exporter.utils.app_data_store import get_settings
 from confluence_markdown_exporter.utils.app_data_store import normalize_instance_url
 from confluence_markdown_exporter.utils.drawio_converter import load_and_parse_drawio
@@ -315,10 +317,15 @@ class Space(BaseModel):
     @classmethod
     @functools.lru_cache(maxsize=100)
     def from_key(cls, space_key: str, base_url: str) -> "Space":
+        needs_homepage = (
+            "{homepage_" in settings.export.page_path
+            or "{homepage_" in settings.export.attachment_path
+        )
+        expand = "homepage" if needs_homepage else ""
         return cls.from_json(
             cast(
                 "JsonResponse",
-                get_thread_confluence(base_url).get_space(space_key, expand="homepage"),
+                get_thread_confluence(base_url).get_space(space_key, expand=expand),
             ),
             base_url,
         )
@@ -342,7 +349,8 @@ class Space(BaseModel):
         get_confluence_instance(base_url)
 
         parsed = urllib.parse.urlparse(space_url)
-        if match := parse_confluence_path(parsed.path):
+        routing_path = routing_path_for_parse(parsed.path, base_url)
+        if match := parse_confluence_path(routing_path):
             if match.space_key:
                 logger.debug("Resolved space key '%s' from URL %s", match.space_key, space_url)
                 return cls.from_key(match.space_key, base_url)
@@ -372,14 +380,29 @@ class Document(BaseModel):
     ancestors: list["Ancestor"]
     version: Version
 
+    def _fetch_homepage_title(self, page_id: int) -> str:
+        """Fetch only the title of a page without expanding body or other heavy fields."""
+        try:
+            data = get_thread_confluence(self.base_url).get_page_by_id(
+                page_id, expand="version"
+            )
+            return data.get("title", "")
+        except Exception:  # noqa: BLE001
+            logger.warning("Could not fetch homepage title for page id=%s", page_id)
+            return ""
+
     @property
     def _template_vars(self) -> dict[str, str]:
         homepage_id = ""
         homepage_title = ""
-        if self.space.homepage:
+        needs_homepage = (
+            "{homepage_" in settings.export.page_path
+            or "{homepage_" in settings.export.attachment_path
+        )
+        if needs_homepage and self.space.homepage:
             homepage_id = str(self.space.homepage)
             homepage_title = sanitize_filename(
-                Page.from_id(self.space.homepage, self.base_url).title
+                self._fetch_homepage_title(self.space.homepage)
             )
 
         return {
@@ -412,8 +435,13 @@ class Attachment(Document):
         return mimetypes.guess_extension(self.media_type) or ""
 
     @property
+    def _file_id_or_fallback(self) -> str:
+        """file_id when available; otherwise fall back to attachment id to keep paths unique."""
+        return self.file_id or self.id or "attachment"
+
+    @property
     def filename(self) -> str:
-        return f"{self.file_id}{self.extension}"
+        return f"{self._file_id_or_fallback}{self.extension}"
 
     @property
     def _template_vars(self) -> dict[str, str]:
@@ -421,8 +449,7 @@ class Attachment(Document):
             **super()._template_vars,
             "attachment_id": str(self.id),
             "attachment_title": sanitize_filename(self.title),
-            # file_id is a GUID and does not need sanitized.
-            "attachment_file_id": self.file_id,
+            "attachment_file_id": self._file_id_or_fallback,
             "attachment_extension": self.extension,
         }
 
@@ -698,7 +725,8 @@ class Page(Document):
                 a.filename.endswith((".drawio.png", ".drawio"))
                 and a.title.replace(" ", "%20") in self.body_export
             )
-            or a.file_id in self.body
+            or (a.file_id and a.file_id in self.body)
+            or (a.id and a.id in self.body)
         ]
 
     def export_attachments(self) -> dict[str, AttachmentEntry]:
@@ -848,7 +876,8 @@ class Page(Document):
         get_confluence_instance(base_url)
 
         parsed = urllib.parse.urlparse(page_url)
-        if match := parse_confluence_path(parsed.path):
+        routing_path = routing_path_for_parse(parsed.path, base_url)
+        if match := parse_confluence_path(routing_path):
             if match.page_id:
                 logger.debug("Resolved page id=%s from Confluence URL %s", match.page_id, page_url)
                 return Page.from_id(match.page_id, base_url)
@@ -875,15 +904,23 @@ class Page(Document):
         """Create a custom MarkdownConverter for Confluence HTML to Markdown conversion."""
 
         class Options(MarkdownConverter.DefaultOptions):  # type: ignore[assignment]
+            autolinks = False
             bullets = "-"
             heading_style = ATX
             macros_to_ignore: Set[str] = frozenset(["qc-read-and-understood-signature-box"])
             front_matter_indent = 2
 
+        _RE_NON_TAG_ANGLE = re.compile(r"<(?![a-zA-Z/!])")
+
         def __init__(self, page: "Page", **options) -> None:  # noqa: ANN003
             super().__init__(**options)
             self.page = page
             self.page_properties = {}
+
+        def escape(self, text: str, parent_tags: list[str]) -> str:
+            return self._RE_NON_TAG_ANGLE.sub(
+                r"\<", super().escape(text, parent_tags)
+            )
 
         @property
         def markdown(self) -> str:
@@ -1140,6 +1177,32 @@ class Page(Document):
                 return f"[^{text}]:"  # Footnote definition
             return f"[^{text}]"  # f"<sup>{text}</sup>"
 
+        def _parse_confluence_link_ref(self, href: str) -> ConfluenceRef | None:
+            """Parse a page/space path from *href* using this page's Confluence base URL."""
+            if not href:
+                return None
+            base_url = self.page.base_url
+            parsed_base = urllib.parse.urlparse(base_url)
+
+            if href.startswith(("http://", "https://")):
+                parsed_href = urllib.parse.urlparse(href)
+                path = parsed_href.path
+                if parsed_href.netloc == parsed_base.netloc:
+                    path = routing_path_for_parse(path, base_url)
+                return parse_confluence_path(path)
+            if href.startswith("//"):
+                scheme = parsed_base.scheme or "https"
+                parsed_href = urllib.parse.urlparse(f"{scheme}:{href}")
+                path = parsed_href.path
+                if parsed_href.netloc == parsed_base.netloc:
+                    path = routing_path_for_parse(path, base_url)
+                return parse_confluence_path(path)
+            if href.startswith("/"):
+                path = urllib.parse.urlparse(href).path
+                path = routing_path_for_parse(path, base_url)
+                return parse_confluence_path(path)
+            return parse_confluence_path(href)
+
         def convert_a(self, el: BeautifulSoup, text: str, parent_tags: list[str]) -> str:  # noqa: PLR0911, C901
             if "user-mention" in str(el.get("class")):
                 return self.convert_user_mention(el, text, parent_tags)
@@ -1177,7 +1240,7 @@ class Page(Document):
                 link = self.convert_attachment_link(el, text, parent_tags)
                 # convert_attachment_link may return None if the attachment meta is incomplete
                 return link or f"[{text}]({el.get('href')})"
-            if match := parse_confluence_path(str(el.get("href", ""))):
+            if match := self._parse_confluence_link_ref(str(el.get("href", ""))):
                 if match.page_id:
                     return self.convert_page_link(match.page_id)
             if str(el.get("href", "")).startswith("#"):
@@ -1190,6 +1253,13 @@ class Page(Document):
             if not page_id:
                 msg = "Page link does not have valid page_id."
                 raise ValueError(msg)
+
+            if settings.export.page_href == "confluence":
+                base = self.page.base_url
+                url = f"{base}/pages/viewpage.action?pageId={page_id}"
+                page = Page.from_id(page_id, base)
+                title = page.title if page.title != "Page not accessible" else f"Page {page_id}"
+                return f"[{title}]({url})"
 
             page = Page.from_id(page_id, self.page.base_url)
 

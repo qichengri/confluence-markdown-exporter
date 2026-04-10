@@ -1,5 +1,3 @@
-from typing import cast
-
 from bs4 import BeautifulSoup
 from bs4 import Tag
 from markdownify import MarkdownConverter
@@ -56,21 +54,71 @@ def make_empty_cell() -> Tag:
 def _normalize_table_cell_text(text: str) -> str:
     return (
         text.replace("|", "\\|")  # Escape pipe characters to prevent breaking table formatting
+        .replace("{", "\\{")  # Escape curly braces to prevent MDX/JSX expression parsing
+        .replace("}", "\\}")
         .replace("\n", "<br/>")  # Replace newlines with <br/> to preserve line breaks in tables
         .removesuffix("<br/>")  # Remove trailing <br/> that may be added by the last cell in a row
         .removeprefix("<br/>")  # Remove leading <br/> that may be added by the first cell in a row
     )
 
 
+def _collect_direct_rows(table: Tag) -> list[list[Tag]]:
+    """Collect only the direct-level <tr> elements of *table*, skipping nested tables."""
+    rows: list[list[Tag]] = []
+    containers = [
+        child
+        for child in table.children
+        if isinstance(child, Tag) and child.name in ("thead", "tbody", "tfoot")
+    ]
+    if not containers:
+        containers = [table]
+    for container in containers:
+        for child in container.children:
+            if isinstance(child, Tag) and child.name == "tr":
+                cells = [c for c in child.children if isinstance(c, Tag) and c.name in ("td", "th")]
+                rows.append(cells)
+    return rows
+
+
+def _has_nested_table(el: Tag) -> bool:
+    """Return True if any cell inside *el* contains a nested <table>."""
+    return any(cell.find("table") for cell in el.find_all(["td", "th"]))
+
+
 class TableConverter(MarkdownConverter):
     """Custom MarkdownConverter for converting HTML tables to markdown tables."""
 
+    def _convert_table_as_html(self, el: BeautifulSoup) -> str:
+        """Output the table as raw HTML to preserve nested structure.
+
+        The output is collapsed to a single line so that MDX parsers do not
+        split the HTML block at blank lines.  Newlines inside ``<pre>`` are
+        kept as ``&#10;`` entities so they still render correctly.  Curly
+        braces are escaped as ``&#123;``/``&#125;`` to avoid JSX expression
+        parsing.
+        """
+        soup = BeautifulSoup(str(el), "html.parser")
+        for pre in soup.find_all("pre"):
+            if pre.string:
+                pre.string = pre.string.replace("\n", "&#10;")
+        html = str(soup)
+        html = html.replace("{", "&#123;").replace("}", "&#125;")
+        html = html.replace("\n", " ")
+        return f"\n{html}\n"
+
     def convert_table(self, el: BeautifulSoup, text: str, parent_tags: list[str]) -> str:
-        rows = [
-            cast("list[Tag]", tr.find_all(["td", "th"]))
-            for tr in cast("list[Tag]", el.find_all("tr"))
-            if tr
-        ]
+        if el.has_attr("style"):
+            del el["style"]
+        for tag in el.find_all(style=True):
+            del tag["style"]
+
+        for a in el.find_all("a", class_="user-mention"):
+            a.replace_with(a.get_text())
+
+        if _has_nested_table(el):
+            return self._convert_table_as_html(el)
+
+        rows = _collect_direct_rows(el)
 
         if not rows:
             return ""

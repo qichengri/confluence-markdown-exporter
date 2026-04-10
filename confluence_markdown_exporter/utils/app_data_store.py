@@ -307,13 +307,14 @@ class ExportConfig(BaseModel):
             "`/path/to/export`: Output will be saved in the specified absolute path.",
         ],
     )
-    page_href: Literal["absolute", "relative"] = Field(
+    page_href: Literal["absolute", "relative", "confluence"] = Field(
         default="relative",
         title="Page Href Style",
         description=(
-            "How to generate page href paths. Options: absolute, relative.\n"
-            "  - `relative` links are relative to the page"
-            "  - `absolute` links start from the configured output path"
+            "How to generate page href paths. Options: absolute, relative, confluence.\n"
+            "  - `relative` links are relative to the page\n"
+            "  - `absolute` links start from the configured output path\n"
+            "  - `confluence` links use the original Confluence web URL"
         ),
     )
     page_path: str = Field(

@@ -16,6 +16,7 @@ from confluence_markdown_exporter.utils.app_data_store import AtlassianSdkConnec
 from confluence_markdown_exporter.utils.app_data_store import get_settings
 from confluence_markdown_exporter.utils.app_data_store import normalize_instance_url
 from confluence_markdown_exporter.utils.app_data_store import set_setting_with_keys
+from confluence_markdown_exporter.utils.rich_console import console
 
 logger = logging.getLogger(__name__)
 
@@ -67,8 +68,10 @@ def _try_fetch_cloud_id(base_url: str) -> str | None:
 
     Returns the cloud ID string, or None if the fetch fails (e.g. for Server instances).
     """
+    tenant_url = f"{base_url}/_edge/tenant_info"
     try:
-        resp = requests.get(f"{base_url}/_edge/tenant_info", timeout=5)
+        console.print(f"API GET {tenant_url} (tenant info)", markup=False, highlight=False)
+        resp = requests.get(tenant_url, timeout=5)
         if resp.ok:
             return resp.json().get("cloudId")
     except Exception as e:  # noqa: BLE001
@@ -118,6 +121,27 @@ _SERVER_URL_RE = re.compile(
 )
 
 
+def routing_path_for_parse(path: str, confluence_base_url: str) -> str:
+    """Strip the Confluence webapp context path from *path* for URL parsing.
+
+    *confluence_base_url* must be the REST/SDK base (e.g. from
+    ``_extract_base_url``), so its ``urlparse(...).path`` matches the servlet
+    prefix (e.g. ``/confluence``). Cloud URLs typically have an empty path
+    prefix, so *path* is returned unchanged.
+    """
+    if not path:
+        return path
+    if not path.startswith("/"):
+        path = "/" + path
+    prefix = urllib.parse.urlparse(confluence_base_url).path.rstrip("/") or ""
+    if not prefix:
+        return path
+    if path == prefix or path.startswith(prefix + "/"):
+        stripped = path[len(prefix):] or "/"
+        return stripped if stripped.startswith("/") else f"/{stripped}"
+    return path
+
+
 def parse_confluence_path(path: str) -> ConfluenceRef | None:
     """Parse only the path portion of a Confluence URL and return a ConfluenceRef dict.
 
@@ -161,6 +185,40 @@ def _jira_auth_failure_hook(
     if response.headers.get("X-Seraph-Loginreason") == "AUTHENTICATED_FAILED":
         msg = f"Jira authentication failed for request to {response.url}"
         raise JiraAuthenticationError(msg)
+    return response
+
+
+def _install_request_logging(session: requests.Session) -> None:
+    """Wrap ``session.send`` to print a console line *before* each HTTP request."""
+    original_send = session.send
+
+    def logging_send(request: requests.PreparedRequest, **kwargs: object) -> requests.Response:
+        console.print(
+            f"API {request.method} {request.url} ...",
+            markup=False,
+            highlight=False,
+        )
+        return original_send(request, **kwargs)
+
+    session.send = logging_send  # type: ignore[method-assign]
+
+
+def log_api_response_hook(
+    response: requests.Response, *_args: object, **_kwargs: object
+) -> requests.Response:
+    """Log every completed HTTP request from the Atlassian SDK session (method, URL, status)."""
+    req = response.request
+    method = getattr(req, "method", "???") if req is not None else "???"
+    url = (
+        getattr(req, "url", None)
+        if req is not None
+        else None
+    ) or getattr(response, "url", None) or "<unknown URL>"
+    console.print(
+        f"API {method} {url} -> HTTP {response.status_code}",
+        markup=False,
+        highlight=False,
+    )
     return response
 
 
@@ -261,8 +319,8 @@ def get_confluence_instance(url: str) -> ConfluenceApiSdk:
         logger.exception("[red bold]Confluence authentication failed for %s.[/red bold]", url)
         raise AuthNotConfiguredError(url, "Confluence") from e
 
-    if settings.export.log_level == "DEBUG":
-        client.session.hooks["response"] = [response_hook]
+    _install_request_logging(client.session)
+    client.session.hooks["response"] = [log_api_response_hook, response_hook]
 
     with _clients_lock:
         _confluence_clients[url] = client
@@ -335,10 +393,12 @@ def get_jira_instance(url: str) -> JiraApiSdk:
         logger.exception("[red bold]Jira authentication failed for %s.[/red bold]", url)
         raise AuthNotConfiguredError(url, "Jira") from e
 
-    client.session.hooks["response"].append(_jira_auth_failure_hook)
-
-    if settings.export.log_level == "DEBUG":
-        client.session.hooks["response"].append(response_hook)
+    _install_request_logging(client.session)
+    client.session.hooks["response"] = [
+        log_api_response_hook,
+        _jira_auth_failure_hook,
+        response_hook,
+    ]
 
     with _clients_lock:
         _jira_clients[url] = client
