@@ -1337,15 +1337,33 @@ class Page(Document):
 
             return md
 
-        def convert_img(self, el: BeautifulSoup, text: str, parent_tags: list[str]) -> str:  # noqa: C901
+        def _resolve_attachment_for_img(self, el: BeautifulSoup) -> Attachment | None:
+            """Match Confluence ``<img>`` metadata to a downloaded :class:`Attachment`."""
             attachment = None
             if fid := el.get("data-media-id"):
-                attachment = self.page.get_attachment_by_file_id(str(fid))
-            if not attachment and (fid := el.get("data-media-id")):
                 attachment = self.page.get_attachment_by_file_id(str(fid))
             if not attachment and (aid := el.get("data-linked-resource-id")):
                 attachment = self.page.get_attachment_by_id(str(aid))
 
+            url_src = str(el.get("src", ""))
+            if ".drawio.png" in url_src and attachment is None:
+                filename = unquote(urlparse(url_src).path.split("/")[-1])
+                drawio_images = self.page.get_attachments_by_title(filename)
+                if drawio_images:
+                    attachment = drawio_images[0]
+
+            return attachment
+
+        def _apply_local_attachment_src_to_img(self, el: Tag) -> None:
+            """Rewrite ``src`` to the exported attachment path when the image is known."""
+            attachment = self._resolve_attachment_for_img(el)
+            if attachment is None:
+                return
+            path = self._get_path_for_href(attachment.export_path, settings.export.attachment_href)
+            el["src"] = path.replace(" ", "%20")
+
+        def convert_img(self, el: BeautifulSoup, text: str, parent_tags: list[str]) -> str:
+            attachment = self._resolve_attachment_for_img(el)
             url_src = str(el.get("src", ""))
 
             if ".drawio.png" in url_src:
@@ -1353,11 +1371,6 @@ class Page(Document):
                 drawio_result = self._convert_drawio_embedded_mermaid(filename)
                 if drawio_result:
                     return drawio_result
-                # If no mermaid diagram extracted, use PNG as attachment fallback
-                if attachment is None:
-                    drawio_images = self.page.get_attachments_by_title(filename)
-                    if len(drawio_images) > 0:
-                        attachment = drawio_images[0]
 
             if attachment is None:
                 href = el.get("href") or text
@@ -1643,6 +1656,19 @@ class Page(Document):
             # Return the markdown content directly (it's already in markdown format)
             # Add newlines for proper spacing
             return f"\n{markdown_content}\n\n"
+
+        def _convert_table_as_html(self, el: BeautifulSoup) -> str:
+            """Keep nested table as HTML; rewrite ``<img>`` to local attachment ``src``."""
+            soup = BeautifulSoup(str(el), "html.parser")
+            for img in soup.find_all("img"):
+                self._apply_local_attachment_src_to_img(img)
+            root = soup.find("table") or next(
+                (c for c in soup.children if isinstance(c, Tag)),
+                None,
+            )
+            if root is None:
+                return super()._convert_table_as_html(el)
+            return super()._convert_table_as_html(root)
 
         def convert_table(self, el: BeautifulSoup, text: str, parent_tags: list[str]) -> str:
             if el.has_attr("class") and "metadata-summary-macro" in el["class"]:
