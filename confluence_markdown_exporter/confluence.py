@@ -4,6 +4,7 @@ https://developer.atlassian.com/cloud/confluence/rest/v1/intro
 """
 
 import functools
+import html
 import json
 import logging
 import mimetypes
@@ -1044,6 +1045,7 @@ class Page(Document):
             summary_text = (
                 summary_element.get_text().strip() if summary_element else "Click here to expand..."
             )
+            summary_safe = html.escape(summary_text)
 
             # Extract content from expand-content
             content_element = el.find("div", class_="expand-content")
@@ -1052,8 +1054,14 @@ class Page(Document):
                 self.process_tag(content_element, parent_tags).strip() if content_element else ""
             )
 
-            # Return as details element
-            return f"\n<details>\n<summary>{summary_text}</summary>\n\n{content}\n\n</details>\n\n"
+            # Pipe-table cells run _normalize_table_cell_text, which turns \n into <br/> and
+            # breaks multi-line <details>. Use a single-line block inside td/th (Docusaurus also
+            # recommends keeping <summary> on one line).
+            if "td" in parent_tags or "th" in parent_tags:
+                inner = re.sub(r"\s+", " ", content).strip()
+                return f"<details><summary>{summary_safe}</summary>{inner}</details>"
+
+            return f"\n<details>\n<summary>{summary_safe}</summary>\n\n{content}\n\n</details>\n\n"
 
         def convert_span(self, el: BeautifulSoup, text: str, parent_tags: list[str]) -> str:
             if el.has_attr("data-macro-name"):

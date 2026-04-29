@@ -1,4 +1,6 @@
 from bs4 import BeautifulSoup
+from bs4 import Comment
+from bs4 import NavigableString
 from bs4 import Tag
 from markdownify import MarkdownConverter
 from tabulate import tabulate
@@ -80,11 +82,6 @@ def _collect_direct_rows(table: Tag) -> list[list[Tag]]:
     return rows
 
 
-def _has_nested_table(el: Tag) -> bool:
-    """Return True if any cell inside *el* contains a nested <table>."""
-    return any(cell.find("table") for cell in el.find_all(["td", "th"]))
-
-
 class TableConverter(MarkdownConverter):
     """Custom MarkdownConverter for converting HTML tables to markdown tables."""
 
@@ -106,6 +103,29 @@ class TableConverter(MarkdownConverter):
         html = html.replace("\n", " ")
         return f"\n{html}\n"
 
+    _CELL_TEXT_PARENT_TAGS = frozenset({"td", "th", "_inline"})
+
+    def _convert_cell_fragment(self, node: Tag | NavigableString) -> str:
+        """Convert one td/th child: nested ``<table>`` subtrees become HTML; else Markdown."""
+        if isinstance(node, Comment):
+            return ""
+        if isinstance(node, NavigableString):
+            return self.process_text(node, parent_tags=self._CELL_TEXT_PARENT_TAGS)
+        if not isinstance(node, Tag):
+            return ""
+        if node.name == "table":
+            return self._convert_table_as_html(node)
+        if not node.find("table"):
+            return self.convert(str(node))
+        return "".join(self._convert_cell_fragment(c) for c in node.children)
+
+    def _convert_table_cell(self, cell: Tag) -> str:
+        """Convert a td/th to Markdown cell text; only nested tables become HTML."""
+        if not cell.find("table"):
+            return self.convert(str(cell))
+        parts = [self._convert_cell_fragment(c) for c in cell.children]
+        return _normalize_table_cell_text("".join(parts))
+
     def convert_table(self, el: BeautifulSoup, text: str, parent_tags: list[str]) -> str:
         if el.has_attr("style"):
             del el["style"]
@@ -115,16 +135,13 @@ class TableConverter(MarkdownConverter):
         for a in el.find_all("a", class_="user-mention"):
             a.replace_with(a.get_text())
 
-        if _has_nested_table(el):
-            return self._convert_table_as_html(el)
-
         rows = _collect_direct_rows(el)
 
         if not rows:
             return ""
 
         padded_rows = pad(rows)
-        converted = [[self.convert(str(cell)) for cell in row] for row in padded_rows]
+        converted = [[self._convert_table_cell(cell) for cell in row] for row in padded_rows]
 
         has_header = all(cell.name == "th" for cell in rows[0])
         if has_header:

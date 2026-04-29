@@ -108,7 +108,7 @@ class TestTableConverter:
         assert "\\|" not in result
 
     def test_nested_table_outputs_html(self) -> None:
-        """A table with a nested <table> inside a cell should output HTML, not pipe."""
+        """Outer table stays pipe Markdown; only nested <table> in a cell becomes HTML."""
         html = """
         <table>
             <tr>
@@ -129,6 +129,8 @@ class TestTableConverter:
         converter = TableConverter()
         result = converter.convert(html)
 
+        assert "---" in result
+        assert result.strip().startswith("|")
         assert "<table>" in result or "<table" in result
         assert "<tr>" in result or "<tr" in result
         assert "<td>" in result or "<td" in result
