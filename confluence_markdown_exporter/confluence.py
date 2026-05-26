@@ -31,6 +31,7 @@ from bs4 import Tag
 from markdownify import ATX
 from markdownify import MarkdownConverter
 from pydantic import BaseModel
+from pydantic import Field
 from requests import HTTPError
 from requests import RequestException
 from rich.progress import BarColumn
@@ -125,8 +126,21 @@ def _extract_base_url(url: str) -> str:
 
 settings = get_settings()
 
+# Confluence embedded images: .../download/attachments/<pageId>/<filename>?...
+_DOWNLOAD_ATTACHMENT_URL_RE = re.compile(
+    r"download/attachments/(\d+)/([^\"'\s<>?]+)",
+    re.IGNORECASE,
+)
 
-class JiraIssue(BaseModel):
+
+def _parse_download_attachment_urls(html: str) -> set[tuple[str, str]]:
+    """Return ``(container_page_id, filename)`` pairs from Confluence download URLs."""
+    return set(_DOWNLOAD_ATTACHMENT_URL_RE.findall(html))
+
+
+def _normalize_attachment_filename(filename: str) -> str:
+    return unquote(filename.split("?")[0].split("/")[-1])
+
     key: str
     summary: str
     description: str | None
@@ -602,6 +616,7 @@ class Page(Document):
     editor2: str
     labels: list["Label"]
     attachments: list["Attachment"]
+    referenced_attachments: list["Attachment"] = Field(default_factory=list, exclude=True, repr=False)
 
     @property
     def descendants(self) -> list["Descendant"]:
@@ -714,27 +729,112 @@ class Page(Document):
             self.markdown,
         )
 
+    def _attachment_reference_html(self) -> str:
+        """HTML sources scanned for embedded attachment references."""
+        parts = [self.body, self.body_export]
+        if settings.export.include_document_title:
+            parts.insert(0, f"<h1>{self.title}</h1>")
+        return "\n".join(parts)
+
+    @staticmethod
+    @functools.lru_cache(maxsize=512)
+    def _fetch_attachments_for_page(base_url: str, page_id: int) -> tuple["Attachment", ...]:
+        return tuple(Attachment.from_page_id(page_id, base_url))
+
+    def find_attachment_by_container_and_filename(
+        self, page_id: str | int, filename: str
+    ) -> "Attachment | None":
+        """Resolve an attachment on *page_id* by its Confluence filename/title."""
+        pid = int(page_id)
+        target = _normalize_attachment_filename(filename)
+        for attachment in self._fetch_attachments_for_page(self.base_url, pid):
+            if attachment.title == target:
+                return attachment
+            if attachment.title.replace(" ", "%20") == target:
+                return attachment
+        return None
+
+    def find_attachment_from_download_url(self, url: str) -> "Attachment | None":
+        match = _DOWNLOAD_ATTACHMENT_URL_RE.search(unquote(url))
+        if not match:
+            return None
+        return self.find_attachment_by_container_and_filename(match.group(1), match.group(2))
+
+    def _iter_attachments_for_lookup(self) -> list["Attachment"]:
+        """Native page attachments plus cross-page attachments exported for this page."""
+        seen: set[str] = set()
+        combined: list[Attachment] = []
+        for attachment in [*self.attachments, *self.referenced_attachments]:
+            if attachment.id in seen:
+                continue
+            seen.add(attachment.id)
+            combined.append(attachment)
+        return combined
+
     def _attachments_for_export(self) -> list["Attachment"]:
         """Return the subset of attachments that should be exported for this page."""
         if settings.export.attachment_export_all:
             return list(self.attachments)
-        return [
-            a
-            for a in self.attachments
-            if (a.filename.endswith(".drawio") and f"diagramName={a.title}" in self.body)
-            or (
-                a.filename.endswith((".drawio.png", ".drawio"))
-                and a.title.replace(" ", "%20") in self.body_export
-            )
-            or (a.file_id and a.file_id in self.body)
-            or (a.id and a.id in self.body)
-        ]
+
+        reference_html = self._attachment_reference_html()
+        seen_ids: set[str] = set()
+        selected: list[Attachment] = []
+
+        def add(attachment: Attachment | None) -> None:
+            if attachment is None or attachment.id in seen_ids:
+                return
+            seen_ids.add(attachment.id)
+            selected.append(attachment)
+
+        for attachment in self.attachments:
+            if (attachment.filename.endswith(".drawio") and f"diagramName={attachment.title}" in self.body) or (
+                attachment.filename.endswith((".drawio.png", ".drawio"))
+                and attachment.title.replace(" ", "%20") in self.body_export
+            ):
+                add(attachment)
+                continue
+            if attachment.file_id and attachment.file_id in reference_html:
+                add(attachment)
+                continue
+            if attachment.id and attachment.id in reference_html:
+                add(attachment)
+
+        for page_id, filename in _parse_download_attachment_urls(reference_html):
+            add(self.find_attachment_by_container_and_filename(page_id, filename))
+
+        for attachment_id in re.findall(r'data-linked-resource-id="(\d+)"', reference_html):
+            for attachment in self._iter_attachments_for_lookup():
+                if attachment_id in attachment.id:
+                    add(attachment)
+                    break
+            else:
+                container_match = re.search(
+                    rf'data-linked-resource-id="{attachment_id}"[^>]*'
+                    rf'data-linked-resource-container-id="(\d+)"',
+                    reference_html,
+                )
+                if container_match is None:
+                    container_match = re.search(
+                        rf'data-linked-resource-container-id="(\d+)"[^>]*'
+                        rf'data-linked-resource-id="{attachment_id}"',
+                        reference_html,
+                    )
+                if container_match:
+                    for candidate in self._fetch_attachments_for_page(
+                        self.base_url, int(container_match.group(1))
+                    ):
+                        if attachment_id in candidate.id:
+                            add(candidate)
+                            break
+
+        return selected
 
     def export_attachments(self) -> dict[str, AttachmentEntry]:
         old_entries = LockfileManager.get_page_attachment_entries(str(self.id))
         new_entries: dict[str, AttachmentEntry] = {}
         output_path = settings.export.output_path
         stats = get_stats()
+        native_attachment_ids = {attachment.id for attachment in self.attachments}
 
         for attachment in self._attachments_for_export():
             att_id = attachment.id
@@ -749,6 +849,10 @@ class Page(Document):
                         "Skipping unchanged attachment '%s' (v%d)", attachment.title, att_version
                     )
                     stats.inc_attachments_skipped()
+                    if att_id not in native_attachment_ids and not any(
+                        ref.id == att_id for ref in self.referenced_attachments
+                    ):
+                        self.referenced_attachments.append(attachment)
                     continue
 
             attachment.export()
@@ -756,6 +860,10 @@ class Page(Document):
                 new_entries[att_id] = AttachmentEntry(
                     version=att_version, path=str(attachment.export_path)
                 )
+            if att_id not in native_attachment_ids and not any(
+                ref.id == att_id for ref in self.referenced_attachments
+            ):
+                self.referenced_attachments.append(attachment)
 
         # Clean up orphaned attachment files when an attachment was re-versioned
         for att_id, old_entry in old_entries.items():
@@ -773,21 +881,25 @@ class Page(Document):
         Confluence Server sometimes stores attachments without a file_id.
         Fall back to the plain attachment.id and return None if nothing matches.
         """
-        for a in self.attachments:
-            if attachment_id in a.id:
-                return a
-            if a.file_id and attachment_id in a.file_id:
-                return a
+        for attachment in self._iter_attachments_for_lookup():
+            if attachment_id in attachment.id:
+                return attachment
+            if attachment.file_id and attachment_id in attachment.file_id:
+                return attachment
         return None
 
     def get_attachment_by_file_id(self, file_id: str) -> Attachment | None:
-        for a in self.attachments:
-            if a.file_id and file_id in a.file_id:
-                return a
+        for attachment in self._iter_attachments_for_lookup():
+            if attachment.file_id and file_id in attachment.file_id:
+                return attachment
         return None
 
     def get_attachments_by_title(self, title: str) -> list[Attachment]:
-        return [attachment for attachment in self.attachments if attachment.title == title]
+        return [
+            attachment
+            for attachment in self._iter_attachments_for_lookup()
+            if attachment.title == title
+        ]
 
     @classmethod
     def from_json(cls, data: JsonResponse, base_url: str) -> "Page":
@@ -1345,7 +1457,17 @@ class Page(Document):
             if not attachment and (aid := el.get("data-linked-resource-id")):
                 attachment = self.page.get_attachment_by_id(str(aid))
 
-            url_src = str(el.get("src", ""))
+            url_src = str(el.get("src", "") or el.get("data-image-src", ""))
+            if attachment is None and url_src:
+                attachment = self.page.find_attachment_from_download_url(url_src)
+
+            if attachment is None and (cid := el.get("data-linked-resource-container-id")):
+                alias = el.get("data-linked-resource-default-alias") or el.get("alt")
+                if alias:
+                    attachment = self.page.find_attachment_by_container_and_filename(
+                        str(cid), str(alias)
+                    )
+
             if ".drawio.png" in url_src and attachment is None:
                 filename = unquote(urlparse(url_src).path.split("/")[-1])
                 drawio_images = self.page.get_attachments_by_title(filename)
